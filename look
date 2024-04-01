@@ -1,512 +1,920 @@
-from typing import Union, Tuple, Dict, Iterable, Optional
+import re
+import warnings
+
+from typing import Union, List, Dict, Optional, Tuple
 
 import pygame
 
-from pygame_gui.core.utility import translate
-from pygame_gui._constants import UI_BUTTON_ON_HOVERED, UI_BUTTON_ON_UNHOVERED, OldType
-from pygame_gui._constants import UI_BUTTON_PRESSED, UI_BUTTON_DOUBLE_CLICKED, UI_BUTTON_START_PRESS
+from pygame_gui.core.interfaces.gui_font_interface import IGUIFontInterface
+
 from pygame_gui.core import ObjectID
-from pygame_gui.core.drawable_shapes import EllipseDrawableShape, RoundedRectangleShape
-from pygame_gui.core.drawable_shapes import RectDrawableShape
+from pygame_gui._constants import UI_TEXT_ENTRY_FINISHED, UI_TEXT_ENTRY_CHANGED, OldType
+
 from pygame_gui.core.interfaces import IContainerLikeInterface, IUIManagerInterface
-from pygame_gui.core.ui_element import UIElement
+from pygame_gui.core.utility import clipboard_paste, clipboard_copy, translate
+
+from pygame_gui.core import UIElement
+from pygame_gui.core.drawable_shapes import RectDrawableShape, RoundedRectangleShape
 
 
-class UIButton(UIElement):
+class UITextEntryLine(UIElement):
     """
-    A push button, a lot of the appearance of the button, including images to be displayed, is
-    setup via the theme file. This button is designed to be pressed, do something, and then reset -
-    rather than to be toggled on or off.
+    A GUI element for text entry from a keyboard, on a single line. The element supports
+    the standard copy and paste keyboard shortcuts CTRL+V, CTRL+C & CTRL+X as well as CTRL+A.
 
-    The button element is reused throughout the UI as part of other elements as it happens to be a
-    very flexible interactive element.
+    There are methods that allow the entry element to restrict the characters that can be input
+    into the text box
 
-    :param relative_rect: Normally a rectangle describing the position (relative to its container) and
-                          dimensions. Also accepts a position Tuple, or Vector2 where the dimensions
-                          will be dynamic depending on the button's contents. Dynamic dimensions can
-                          be requested by setting the required dimension to -1.
-    :param text: Text for the button.
+    The height of the text entry line element will be determined by the font used rather than
+    the standard method for UIElements of just using the height of the input rectangle.
+
+    :param relative_rect: A rectangle describing the position and width of the text entry element.
     :param manager: The UIManager that manages this element. If not provided or set to None,
                     it will try to use the first UIManager that was created by your application.
     :param container: The container that this element is within. If not provided or set to None
                       will be the root window's container.
-    :param tool_tip_text: Optional tool tip text, can be formatted with HTML. If supplied will
-                          appear on hover.
-    :param starting_height: The height in layers above it's container that this element will be
-                            placed.
     :param parent_element: The element this element 'belongs to' in the theming hierarchy.
     :param object_id: A custom defined ID for fine tuning of theming.
     :param anchors: A dictionary describing what this element's relative_rect is relative to.
-    :param allow_double_clicks: Enables double clicking on buttons which will generate a
-                                unique event.
-    :param visible: Whether the element is visible by default. Warning - container visibility may
-                    override this.
-    :param text_kwargs: a dictionary of variable arguments to pass to the translated string
-                        useful when you have multiple translations that need variables inserted
-                        in the middle.
+    :param visible: Whether the element is visible by default. Warning - container visibility
+                    may override this.
+    :param: initial_text: A string that will start in this box. This text will remain when box is focused
+                          for editing.
+    :param: placeholder_text: If the text line is empty, and not focused, this placeholder text will be
+                              shown instead.
     """
 
-    def __init__(self, relative_rect: Union[pygame.Rect, Tuple[float, float], pygame.Vector2],
-                 text: str,
+    _number_character_set = {'en': ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']}
+
+    # excluding these characters won't ensure that user entered text is a valid filename but they
+    # can help reduce the problems that input will leave you with.
+    _forbidden_file_path_characters = {'en': ['<', '>', ':', '"', '/',
+                                              '\\', '|', '?', '*', '\0', '.']}
+
+    _alphabet_characters_lower = {'en': ['a', 'b', 'c', 'd', 'e', 'f', 'g',
+                                         'h', 'i', 'j', 'k', 'l', 'm', 'n',
+                                         'o', 'p', 'q', 'r', 's', 't', 'u',
+                                         'v', 'w', 'x', 'y', 'z']}
+    _alphabet_characters_upper: Dict[str, List[str]] = {
+        'en': [char.upper() for char in _alphabet_characters_lower['en']],
+        'ja': [],  # no upper case in japanese
+        'zh': []}  # no upper case in chinese
+
+    _alphabet_characters_all = {'en': _alphabet_characters_lower['en'] +
+                                _alphabet_characters_upper['en']}
+
+    _alpha_numeric_characters = {'en': (_alphabet_characters_all['en'] +
+                                        _number_character_set['en'])}
+
+    def __init__(self,
+                 relative_rect: Union[pygame.Rect, Tuple[int, int, int, int]],
                  manager: Optional[IUIManagerInterface] = None,
                  container: Optional[IContainerLikeInterface] = None,
-                 tool_tip_text: Union[str, None] = None,
-                 starting_height: int = 1,
-                 parent_element: UIElement = None,
-                 object_id: Union[ObjectID, str, None] = None,
-                 anchors: Dict[str, Union[str, UIElement]] = None,
-                 allow_double_clicks: bool = False,
-                 generate_click_events_from: Iterable[int] = frozenset([pygame.BUTTON_LEFT]),
+                 parent_element: Optional[UIElement] = None,
+                 object_id: Optional[Union[ObjectID, str]] = None,
+                 anchors: Optional[Dict[str, Union[str, UIElement]]] = None,
                  visible: int = 1,
                  *,
-                 tool_tip_object_id: Optional[ObjectID] = None,
-                 text_kwargs: Optional[Dict[str, str]] = None,
-                 tool_tip_text_kwargs: Optional[Dict[str, str]] = None,
-                 ):
+                 initial_text: Optional[str] = None,
+                 placeholder_text: Optional[str] = None):
 
-        rel_rect = (relative_rect if isinstance(relative_rect, pygame.Rect)
-                    else pygame.Rect(relative_rect, (-1, -1)))
-        super().__init__(rel_rect,
-                         manager, container,
-                         starting_height=starting_height,
-                         layer_thickness=1,
-                         anchors=anchors,
-                         visible=visible)
+        super().__init__(relative_rect, manager, container,
+                         starting_height=1, layer_thickness=1,
+                         anchors=anchors, visible=visible)
 
         self._create_valid_ids(container=container,
                                parent_element=parent_element,
                                object_id=object_id,
-                               element_id='button')
+                               element_id='text_entry_line')
 
-        self.text = text
-        self.text_kwargs = {}
-        if text_kwargs is not None:
-            self.text_kwargs = text_kwargs
+        self.text = ""
+        if initial_text is not None:
+            self.text = translate(initial_text)
+        self.is_text_hidden = False
+        self.hidden_text_char = '●'
+        self.placeholder_text = ""
+        if placeholder_text is not None:
+            self.placeholder_text = placeholder_text
 
-        self.dynamic_dimensions_orig_top_left = rel_rect.topleft
-        # support for an optional 'tool tip' element attached to this button
-        self.set_tooltip(tool_tip_text, tool_tip_object_id, tool_tip_text_kwargs)
-        self.ui_root_container = self.ui_manager.get_root_container()
+        # theme font
+        self.font: Optional[IGUIFontInterface] = None
 
-        # Some different states our button can be in, could use a state machine for this
-        # if we wanted.
-        self.held = False
-        self.pressed = False
-        self.is_selected = False
-        # Used to check button pressed without going through pygame.Event system
-        self.pressed_event = False
+        self.shadow_width = None
+        self.border_width = None
+        self.padding = None
+        self.text_surface = None
+        self.cursor = None
+        self.background_and_border = None
+        self.text_image_rect = None
 
-        # timer for double clicks
-        self.last_click_button = None
-        self.allow_double_clicks = allow_double_clicks
+        # colours from theme
+        self.background_colour = None
+        self.text_colour = None
+        self.selected_text_colour = None
+        self.selected_bg_colour = None
+        self.border_colour = None
+        self.disabled_background_colour = None
+        self.disabled_border_colour = None
+        self.disabled_text_colour = None
+        self.text_cursor_colour = None
+        self.padding = (0, 0)
+
+        self.shape = 'rectangle'
+        self.shape_corner_radius = None
+
+        # input timings - I expect nobody really wants to mess with these that much
+        # ideally we could populate from the os settings but that sounds like a headache
+        self.key_repeat = 0.5
+        self.cursor_blink_delay_after_moving_acc = 0.0
+        self.cursor_blink_delay_after_moving = 1.0
+        self.blink_cursor_time_acc = 0.0
+        self.blink_cursor_time = 0.4
+
         self.double_click_timer = self.ui_manager.get_double_click_time() + 1.0
 
-        self.generate_click_events_from = generate_click_events_from
+        self.start_text_offset = 0
+        self.edit_position = 0
+        self._select_range = [0, 0]
+        self.selection_in_progress = False
 
-        self.text_surface = None
-        self.aligned_text_rect = None
+        self.cursor_on = False
+        self.cursor_has_moved_recently = False
+        self.text_entered = False  # Reset when enter key up or focus lost
 
-        self._set_image(None)
-
-        # default range at which we 'let go' of a button
-        self.hold_range = (0, 0)
-
-        # initialise theme parameters
-        self.colours = {}
-
-        self.font = None
-
-        self.normal_image = None
-        self.hovered_image = None
-        self.selected_image = None
-        self.disabled_image = None
-
-        self.text_horiz_alignment = 'center'
-        self.text_vert_alignment = 'center'
-        self.text_horiz_alignment_padding = 0
-        self.text_vert_alignment_padding = 0
-        self.text_horiz_alignment_method = 'rect'
-        self.shape = 'rectangle'
-        self.text_shadow_size = 0
-        self.text_shadow_offset = (0, 0)
-
-        self.state_transitions = {}
+        # restrictions on text input
+        self.allowed_characters: Optional[List[str]] = None
+        self.forbidden_characters: Optional[List[str]] = None
+        self.length_limit: Optional[int] = None
 
         self.rebuild_from_changed_theme_data()
 
-    def _set_any_images_from_theme(self) -> bool:
+    @property
+    def select_range(self):
         """
-        Grabs images for this button from the UI theme if any are set.
+        The selected range for this text. A tuple containing the start
+        and end indexes of the current selection.
 
-        :return: True if any of the images have changed since last time they were set.
-
+        Made into a property to keep it synchronised with the underlying drawable shape's
+        representation.
         """
+        return self._select_range
 
-        changed = False
-        normal_image = None
-        try:
-            normal_image = self.ui_theme.get_image('normal_image', self.combined_element_ids)
-        except LookupError:
-            normal_image = None
-        finally:
-            if normal_image != self.normal_image:
-                self.normal_image = normal_image
-                self.hovered_image = normal_image
-                self.selected_image = normal_image
-                self.disabled_image = normal_image
-                changed = True
-
-        hovered_image = None
-        try:
-            hovered_image = self.ui_theme.get_image('hovered_image', self.combined_element_ids)
-        except LookupError:
-            hovered_image = self.normal_image
-        finally:
-            if hovered_image != self.hovered_image:
-                self.hovered_image = hovered_image
-                changed = True
-
-        selected_image = None
-        try:
-            selected_image = self.ui_theme.get_image('selected_image', self.combined_element_ids)
-        except LookupError:
-            selected_image = self.normal_image
-        finally:
-            if selected_image != self.selected_image:
-                self.selected_image = selected_image
-                changed = True
-
-        disabled_image = None
-        try:
-            disabled_image = self.ui_theme.get_image('disabled_image', self.combined_element_ids)
-        except LookupError:
-            disabled_image = self.normal_image
-        finally:
-            if disabled_image != self.disabled_image:
-                self.disabled_image = disabled_image
-                changed = True
-
-        return changed
-
-    def kill(self):
-        """
-        Overrides the standard sprite kill method to also kill any tooltips belonging to
-        this button.
-        """
-        super().kill()
-
-    def hover_point(self, hover_x: int, hover_y: int) -> bool:
-        """
-        Tests if a position should be considered 'hovering' the button. Normally this just means
-        our mouse pointer is inside the buttons rectangle, however if we are holding onto the
-        button for a purpose(e.g. dragging a window around by it's menu bar) the hover radius can
-        be made to grow so we don't keep losing touch with whatever we are moving.
-
-        :param hover_x: horizontal pixel co-ordinate to test.
-        :param hover_y: vertical pixel co-ordinate to test
-
-        :return: Returns True if we are hovering.
-
-        """
-        if self.held:
-            return self.in_hold_range((hover_x, hover_y))
-        else:
-            return super().hover_point(hover_x, hover_y)
-
-    def can_hover(self) -> bool:
-        """
-        Tests whether we can trigger the hover state for this button, other states take
-        priority over it.
-
-        :return: True if we are able to hover this button.
-
-        """
-        return not self.is_selected and self.is_enabled and not self.held
-
-    def on_hovered(self):
-        """
-        Called when we enter the hover state, it sets the colours and image of the button
-        to the appropriate values and redraws it.
-        """
-        super().on_hovered()
-        self.drawable_shape.set_active_state('hovered')
-
-        # old event to remove in 0.8.0
-        event_data = {'user_type': OldType(UI_BUTTON_ON_HOVERED),
-                      'ui_element': self,
-                      'ui_object_id': self.most_specific_combined_id}
-        pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
-        # new event
-        event_data = {'ui_element': self,
-                      'ui_object_id': self.most_specific_combined_id}
-        pygame.event.post(pygame.event.Event(UI_BUTTON_ON_HOVERED, event_data))
-
-    def on_unhovered(self):
-        """
-        Called when we leave the hover state. Resets the colours and images to normal and kills any
-        tooltip that was created while we were hovering the button.
-        """
-        super().on_unhovered()
+    @select_range.setter
+    def select_range(self, value):
+        self._select_range = value
+        start_select = min(self._select_range[0], self._select_range[1])
+        end_select = max(self._select_range[0], self._select_range[1])
         if self.drawable_shape is not None:
-            self.drawable_shape.set_active_state(self._get_appropriate_state_name())
+            self.drawable_shape.text_box_layout.set_text_selection(start_select, end_select)
+            self.drawable_shape.apply_active_text_changes()
 
-        # old event to remove in 0.8.0
-        event_data = {'user_type': OldType(UI_BUTTON_ON_UNHOVERED),
-                      'ui_element': self,
-                      'ui_object_id': self.most_specific_combined_id}
-        pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
-
-        # new event
-        event_data = {'ui_element': self,
-                      'ui_object_id': self.most_specific_combined_id}
-        pygame.event.post(pygame.event.Event(UI_BUTTON_ON_UNHOVERED, event_data))
-
-    def _get_appropriate_state_name(self):
+    def set_text_hidden(self, is_hidden=True):
         """
-        Returns a string representing the appropriate state for the widgets DrawableShapes.
-        Currently only returns either 'normal' or 'disabled' based on is_enabled.
+        Passing in True will hide text typed into the text line, replacing it with ●
+        characters and also disallow copying the text into the clipboard. It is designed
+        for basic 'password box' usage.
+
+        :param is_hidden: Can be set to True or False. Defaults to True because
+                          if you are calling this you likely want a password box with no fuss.
+                          Set it back to False if you want to un-hide the text (e.g.
+                          for one of those 'Show my password' buttons).
         """
 
-        if self.is_enabled:
-            if self.is_selected:
-                return "selected"
-            elif self.hovered:
-                return "hovered"
+        self.is_text_hidden = is_hidden
+        self.rebuild()
+
+    def rebuild(self):
+        """
+        Rebuild whatever needs building.
+
+        """
+
+        display_text = self.text
+        if self.is_text_hidden:
+            # test if self.hidden_text_char is supported by font here
+            if self.font.get_metrics(self.hidden_text_char)[0] is None:
+                self.hidden_text_char = '*'
+                if self.font.get_metrics(self.hidden_text_char)[0] is None:
+                    self.hidden_text_char = '.'
+                    if self.font.get_metrics(self.hidden_text_char)[0] is None:
+                        raise ValueError('Selected font for UITextEntryLine does not contain '
+                                         '●, * or . characters used for hidden text. Please choose'
+                                         'a different font for this element')
+            display_text = self.hidden_text_char*len(self.text)
+
+        theming_parameters = {'normal_bg': self.background_colour,
+                              'normal_text': self.text_colour,
+                              'normal_text_shadow': pygame.Color('#000000'),
+                              'normal_border': self.border_colour,
+                              'disabled_bg': self.disabled_background_colour,
+                              'disabled_text': self.disabled_text_colour,
+                              'disabled_text_shadow': pygame.Color('#000000'),
+                              'disabled_border': self.disabled_border_colour,
+                              'selected_text': self.selected_text_colour,
+                              'selected_bg': self.selected_bg_colour,
+                              'text_cursor_colour': self.text_cursor_colour,
+                              'border_width': self.border_width,
+                              'shadow_width': self.shadow_width,
+                              'font': self.font,
+                              'text': display_text if len(display_text) > 0 else translate(self.placeholder_text),
+                              'text_width': -1,
+                              'text_horiz_alignment': 'left',
+                              'text_vert_alignment': 'centre',
+                              'text_horiz_alignment_padding': self.padding[0],
+                              'text_vert_alignment_padding': self.padding[1],
+                              'shape_corner_radius': self.shape_corner_radius}
+
+        if self.shape == 'rectangle':
+            self.drawable_shape = RectDrawableShape(self.rect, theming_parameters,
+                                                    ['normal', 'disabled'], self.ui_manager)
+        elif self.shape == 'rounded_rectangle':
+            self.drawable_shape = RoundedRectangleShape(self.rect, theming_parameters,
+                                                        ['normal', 'disabled'], self.ui_manager)
+
+        if self.drawable_shape is not None:
+            self._set_image(self.drawable_shape.get_fresh_surface())
+            if self.rect.width == -1 or self.rect.height == -1:
+                self.set_dimensions(self.drawable_shape.containing_rect.size)
+
+    def set_text_length_limit(self, limit: int):
+        """
+        Allows a character limit to be set on the text entry element. By default there is no
+        limit on the number of characters that can be entered.
+
+        :param limit: The character limit as an integer.
+
+        """
+        self.length_limit = limit
+
+    def get_text(self) -> str:
+        """
+        Gets the text in the entry line element.
+
+        :return: A string.
+
+        """
+        return self.text
+
+    def set_text(self, text: str):
+        """
+        Allows the text displayed in the text entry element to be set via code. Useful for
+        setting an initial or existing value that is able to be edited.
+
+        The string to set must be valid for the text entry element for this to work.
+
+        :param text: The text string to set.
+
+        """
+        if self.validate_text_string(text):
+            within_length_limit = True
+            if self.length_limit is not None and len(text) > self.length_limit:
+                within_length_limit = False
+            if within_length_limit:
+                self.text = text
+                self.edit_position = len(self.text)
+                display_text = self.text
+                if self.is_text_hidden:
+                    display_text = self.hidden_text_char * len(self.text)
+                if self.drawable_shape is not None:
+                    self.drawable_shape.set_text(display_text if len(display_text) > 0
+                                                 else translate(self.placeholder_text))
+                    self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                    self.drawable_shape.apply_active_text_changes()
             else:
-                return "normal"
-        return "disabled"
+                warnings.warn("Tried to set text string that is too long on text entry element")
+        else:
+            warnings.warn("Tried to set text string with invalid characters on text entry element")
+
+    def redraw(self):
+        """
+        Redraws the entire text entry element onto the underlying sprite image. Usually called
+        when the displayed text has been edited or changed in some fashion.
+        """
+        if self.drawable_shape is not None:
+            self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+            self.drawable_shape.redraw_all_states()
 
     def update(self, time_delta: float):
         """
-        Sets the pressed state for an update cycle if we've pressed this button recently.
+        Called every update loop of our UI Manager. Largely handles text drag selection and
+        making sure our edit cursor blinks on and off.
 
-        :param time_delta: the time in seconds between one call to update and the next.
+        :param time_delta: The time in seconds between this update method call and the previous one.
 
         """
         super().update(time_delta)
-        if self.alive():
-            # clear pressed state, we only want it to last one update cycle
-            self.pressed = False
 
-            if self.pressed_event:
-                # if a pressed event has occurred set the button to the pressed state for one cycle.
-                self.pressed_event = False
-                self.pressed = True
+        if not self.alive():
+            return
+        scaled_mouse_pos = self.ui_manager.get_mouse_position()
+        if self.hovered:
+            self.ui_manager.set_text_input_hovered(True)
 
-            if (self.allow_double_clicks and
-                    self.double_click_timer < self.ui_manager.get_double_click_time()):
-                self.double_click_timer += time_delta
+        if self.double_click_timer < self.ui_manager.get_double_click_time():
+            self.double_click_timer += time_delta
+        if self.selection_in_progress:
+            drawable_shape_space_click = (scaled_mouse_pos[0] - self.rect.left,
+                                          scaled_mouse_pos[1] - self.rect.top)
+            if self.drawable_shape is not None:
+                self.drawable_shape.text_box_layout.set_cursor_from_click_pos(
+                    drawable_shape_space_click)
+                self.drawable_shape.apply_active_text_changes()
+                select_end_pos = self.drawable_shape.text_box_layout.get_cursor_index()
+                new_range = [self.select_range[0], select_end_pos]
+
+                if new_range[0] != self.select_range[0] or new_range[1] != self.select_range[1]:
+                    self.select_range = [new_range[0], new_range[1]]
+
+                    self.edit_position = self.select_range[1]
+                    self.cursor_has_moved_recently = True
+
+        if self.cursor_has_moved_recently:
+            self.cursor_has_moved_recently = False
+            self.cursor_blink_delay_after_moving_acc = 0.0
+            self.cursor_on = True
+            if self.drawable_shape is not None:
+                self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                self.drawable_shape.toggle_text_cursor()
+                self.drawable_shape.apply_active_text_changes()
+
+        if self.cursor_blink_delay_after_moving_acc > self.cursor_blink_delay_after_moving:
+            if self.blink_cursor_time_acc >= self.blink_cursor_time:
+                self.blink_cursor_time_acc = 0.0
+                if self.cursor_on:
+                    self.cursor_on = False
+                    if self.drawable_shape is not None:
+                        self.drawable_shape.toggle_text_cursor()
+                elif self.is_focused:
+                    self.cursor_on = True
+                    if self.drawable_shape is not None:
+                        self.drawable_shape.toggle_text_cursor()
+            else:
+                self.blink_cursor_time_acc += time_delta
+        else:
+            self.cursor_blink_delay_after_moving_acc += time_delta
+
+    def unfocus(self):
+        """
+        Called when this element is no longer the current focus.
+        """
+        super().unfocus()
+        pygame.key.set_repeat(0)
+        self.select_range = [0, 0]
+        self.edit_position = 0
+        self.cursor_on = False
+        self.text_entered = False
+        if len(self.text) == 0:
+            if self.drawable_shape is not None:
+                self.drawable_shape.set_text(translate(self.placeholder_text))
+                self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                self.drawable_shape.apply_active_text_changes()
+        self.redraw()
+
+    def focus(self):
+        """
+        Called when we 'select focus' on this element. In this case it sets up the keyboard to
+        repeat held key presses, useful for natural feeling keyboard input.
+        """
+        super().focus()
+        pygame.key.set_repeat(500, 25)
+        if len(self.text) == 0:
+            if self.drawable_shape is not None:
+                self.drawable_shape.set_text(self.text)
+                self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                self.drawable_shape.apply_active_text_changes()
 
     def process_event(self, event: pygame.event.Event) -> bool:
         """
-        Handles various interactions with the button.
+        Allows the text entry box to react to input events, which is it's primary function.
+        The entry element reacts to various types of mouse clicks (double click selecting words,
+        drag select), keyboard combos (CTRL+C, CTRL+V, CTRL+X, CTRL+A), individual editing keys
+        (Backspace, Delete, Left & Right arrows) and other keys for inputting letters, symbols
+        and numbers.
 
-        :param event: The event to process.
+        :param event: The current event to consider reacting to.
 
-        :return: Return True if we want to consume this event so it is not passed on to the
-                 rest of the UI.
+        :return: Returns True if we've done something with the input event.
 
         """
         consumed_event = False
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button in self.generate_click_events_from:
-            scaled_mouse_pos = self.ui_manager.calculate_scaled_mouse_position(event.pos)
-            if self.hover_point(scaled_mouse_pos[0], scaled_mouse_pos[1]):
-                if self.is_enabled:
-                    if (self.allow_double_clicks and self.last_click_button == event.button and
-                            self.double_click_timer <= self.ui_manager.get_double_click_time()):
-                        # old event to remove in 0.8.0
-                        event_data = {'user_type': OldType(UI_BUTTON_DOUBLE_CLICKED),
-                                      'ui_element': self,
-                                      'ui_object_id': self.most_specific_combined_id}
-                        pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
+        initial_text_state = self.text
+        if self._process_mouse_button_event(event):
+            consumed_event = True
+        if self.is_enabled and self.is_focused and event.type == pygame.KEYDOWN:
+            if self._process_keyboard_shortcut_event(event):
+                consumed_event = True
+            elif self._process_action_key_event(event):
+                consumed_event = True
 
-                        # new event
-                        event_data = {'ui_element': self,
-                                      'ui_object_id': self.most_specific_combined_id,
-                                      'mouse_button': event.button}
-                        pygame.event.post(pygame.event.Event(UI_BUTTON_DOUBLE_CLICKED, event_data))
+        if self.is_enabled and self.is_focused and event.type == pygame.TEXTINPUT:
+            processed_any_char = False
+            for char in event.text:
+                if self._process_entered_character(char):
+                    processed_any_char = True
+            consumed_event = processed_any_char
+
+        if self.is_enabled and self.is_focused and event.type == pygame.KEYUP:
+            if event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER:
+                self.text_entered = False  # reset text input entry
+
+        if self.text != initial_text_state:
+            # old event to be removed in 0.8.0
+            event_data = {'user_type': OldType(UI_TEXT_ENTRY_CHANGED),
+                          'text': self.text,
+                          'ui_element': self,
+                          'ui_object_id': self.most_specific_combined_id}
+            pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
+
+            # new event
+            event_data = {'text': self.text,
+                          'ui_element': self,
+                          'ui_object_id': self.most_specific_combined_id}
+            pygame.event.post(pygame.event.Event(UI_TEXT_ENTRY_CHANGED, event_data))
+        return consumed_event
+
+    def _process_text_entry_key(self, event: pygame.event.Event) -> bool:
+        consumed_event = False
+        if hasattr(event, 'unicode'):
+            consumed_event = self._process_entered_character(event.unicode)
+        return consumed_event
+
+    def _process_entered_character(self, character: str) -> bool:
+        """
+        Process key input that can be added to the text entry text.
+
+        :param event: The event to process.
+
+        :return: True if consumed.
+        """
+        processed_character = False
+        within_length_limit = True
+        if (self.length_limit is not None
+                and (len(self.text) -
+                     abs(self.select_range[0] -
+                         self.select_range[1])) >= self.length_limit):
+            within_length_limit = False
+        if within_length_limit and self.font is not None:
+            char_metrics = self.font.get_metrics(character)
+            if len(char_metrics) > 0 and char_metrics[0] is not None:
+                valid_character = True
+                if (self.allowed_characters is not None and
+                        character not in self.allowed_characters):
+                    valid_character = False
+                if (self.forbidden_characters is not None and
+                        character in self.forbidden_characters):
+                    valid_character = False
+                if valid_character:
+                    if abs(self.select_range[0] - self.select_range[1]) > 0:
+                        low_end = min(self.select_range[0], self.select_range[1])
+                        high_end = max(self.select_range[0], self.select_range[1])
+                        self.text = self.text[:low_end] + character + self.text[high_end:]
+
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.set_text(self.text)
+                        self.edit_position = low_end + 1
+                        self.select_range = [0, 0]
                     else:
-                        # old event to remove in 0.8.0
-                        event_data = {'user_type': OldType(UI_BUTTON_START_PRESS),
-                                      'ui_element': self,
-                                      'ui_object_id': self.most_specific_combined_id}
-                        pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
+                        start_str = self.text[:self.edit_position]
+                        end_str = self.text[self.edit_position:]
+                        self.text = start_str + character + end_str
+                        display_character = character
+                        if self.is_text_hidden:
+                            display_character = self.hidden_text_char
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.insert_text(display_character, self.edit_position)
 
-                        # new event
-                        event_data = {'ui_element': self,
-                                      'ui_object_id': self.most_specific_combined_id,
-                                      'mouse_button': event.button}
-                        pygame.event.post(pygame.event.Event(UI_BUTTON_START_PRESS, event_data))
-                        self.double_click_timer = 0.0
-                        self.last_click_button = event.button
-                        self.held = True
-                        self.hovered = False
-                        self.on_unhovered()
-                        self._set_active()
+                        self.edit_position += 1
+                    self.cursor_has_moved_recently = True
+                    processed_character = True
+        return processed_character
 
-                consumed_event = True
-        if event.type == pygame.MOUSEBUTTONUP and event.button in self.generate_click_events_from:
-            scaled_mouse_pos = self.ui_manager.calculate_scaled_mouse_position(event.pos)
-            if (self.is_enabled and
-                    self.drawable_shape.collide_point(scaled_mouse_pos) and
-                    self.held):
-                self.held = False
-                self._set_inactive()
-                consumed_event = True
-                self.pressed_event = True
+    def _process_action_key_event(self, event: pygame.event.Event) -> bool:
+        """
+        Check if event is one of the keys that triggers an action like deleting, or moving
+        the edit position.
 
-                # old event
-                event_data = {'user_type': OldType(UI_BUTTON_PRESSED),
-                              'ui_element': self,
-                              'ui_object_id': self.most_specific_combined_id}
-                pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
+        :param event: The event to check.
 
-                # new event
-                event_data = {'ui_element': self,
-                              'ui_object_id': self.most_specific_combined_id,
-                              'mouse_button': event.button}
-                pygame.event.post(pygame.event.Event(UI_BUTTON_PRESSED, event_data))
+        :return: True if event is consumed.
 
-            if self.is_enabled and self.held:
-                self.held = False
-                self._set_inactive()
-                consumed_event = True
+        """
+        consumed_event = False
+        if ((event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER)
+                and not self.text_entered):
+            # old event - to be removed in 0.8.0
+            event_data = {'user_type': OldType(UI_TEXT_ENTRY_FINISHED),
+                          'text': self.text,
+                          'ui_element': self,
+                          'ui_object_id': self.most_specific_combined_id}
+            pygame.event.post(pygame.event.Event(pygame.USEREVENT, event_data))
+
+            # new event
+            event_data = {'text': self.text,
+                          'ui_element': self,
+                          'ui_object_id': self.most_specific_combined_id}
+            pygame.event.post(pygame.event.Event(UI_TEXT_ENTRY_FINISHED, event_data))
+            consumed_event = True
+            self.text_entered = True
+        elif event.key == pygame.K_BACKSPACE:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.delete_selected_text()
+                    self.drawable_shape.apply_active_text_changes()
+                low_end = min(self.select_range[0], self.select_range[1])
+                high_end = max(self.select_range[0], self.select_range[1])
+                self.text = self.text[:low_end] + self.text[high_end:]
+                self.edit_position = low_end
+                self.select_range = [0, 0]
+                self.cursor_has_moved_recently = True
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                    self.drawable_shape.apply_active_text_changes()
+            elif self.edit_position > 0 and self.font is not None:
+                if self.start_text_offset > 0:
+                    self.start_text_offset -= self.font.get_rect(
+                        self.text[self.edit_position - 1]).width
+                self.text = self.text[:self.edit_position - 1] + self.text[self.edit_position:]
+                self.edit_position -= 1
+                self.cursor_has_moved_recently = True
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.backspace_at_cursor()
+                    self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                    self.drawable_shape.apply_active_text_changes()
+            consumed_event = True
+        elif event.key == pygame.K_DELETE:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.delete_selected_text()
+                    self.drawable_shape.apply_active_text_changes()
+                low_end = min(self.select_range[0], self.select_range[1])
+                high_end = max(self.select_range[0], self.select_range[1])
+                self.text = self.text[:low_end] + self.text[high_end:]
+                self.edit_position = low_end
+                self.select_range = [0, 0]
+                self.cursor_has_moved_recently = True
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                    self.drawable_shape.apply_active_text_changes()
+            elif self.edit_position < len(self.text):
+                self.text = self.text[:self.edit_position] + self.text[self.edit_position + 1:]
+                self.edit_position = self.edit_position
+                self.cursor_has_moved_recently = True
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.delete_at_cursor()
+                    self.drawable_shape.apply_active_text_changes()
+            consumed_event = True
+        elif self._process_edit_pos_move_key(event):
+            consumed_event = True
 
         return consumed_event
 
-    def check_pressed(self) -> bool:
+    def _process_edit_pos_move_key(self, event: pygame.event.Event) -> bool:
         """
-        A direct way to check if this button has been pressed in the last update cycle.
+        Process an action key that is moving the cursor edit position.
 
-        :return: True if the button has been pressed.
+        :param event: The event to process.
+
+        :return: True if event is consumed.
 
         """
-        return self.pressed
+        consumed_event = False
+        if event.key == pygame.K_LEFT:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                self.edit_position = min(self.select_range[0], self.select_range[1])
+                self.select_range = [0, 0]
+                self.cursor_has_moved_recently = True
+            elif self.edit_position > 0:
+                self.edit_position -= 1
+                self.cursor_has_moved_recently = True
+            consumed_event = True
+        elif event.key == pygame.K_RIGHT:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                self.edit_position = max(self.select_range[0], self.select_range[1])
+                self.select_range = [0, 0]
+                self.cursor_has_moved_recently = True
+            elif self.edit_position < len(self.text):
+                self.edit_position += 1
+                self.cursor_has_moved_recently = True
+            consumed_event = True
+        elif event.key == pygame.K_HOME:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                self.select_range = [0, 0]
+            self.edit_position = 0
+            self.cursor_has_moved_recently = True
+            consumed_event = True
+        elif event.key == pygame.K_END:
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                self.select_range = [0, 0]
+            self.edit_position = len(self.text)
+            self.cursor_has_moved_recently = True
+            consumed_event = True
+        return consumed_event
 
-    def disable(self):
+    def _process_keyboard_shortcut_event(self, event: pygame.event.Event) -> bool:
         """
-        Disables the button so that it is no longer interactive.
+        Check if event is one of the CTRL key keyboard shortcuts.
+
+        :param event: event to process.
+
+        :return: True if event consumed.
+
         """
-        if self.is_enabled:
-            self.is_enabled = False
+        consumed_event = False
+        if (event.key == pygame.K_a and
+                (event.mod & pygame.KMOD_CTRL or event.mod & pygame.KMOD_META)):
+            self.select_range = [0, len(self.text)]
+            self.edit_position = len(self.text)
+            self.cursor_has_moved_recently = True
+            consumed_event = True
+        elif (event.key == pygame.K_x and
+              (event.mod & pygame.KMOD_CTRL or event.mod & pygame.KMOD_META) and
+              not self.is_text_hidden):
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                low_end = min(self.select_range[0], self.select_range[1])
+                high_end = max(self.select_range[0], self.select_range[1])
+                clipboard_copy(self.text[low_end:high_end])
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.delete_selected_text()
+                    self.drawable_shape.apply_active_text_changes()
+                self.edit_position = low_end
+                self.text = self.text[:low_end] + self.text[high_end:]
+                if self.drawable_shape is not None:
+                    self.drawable_shape.text_box_layout.set_cursor_position(self.edit_position)
+                    self.drawable_shape.apply_active_text_changes()
+                self.select_range = [0, 0]
+                self.cursor_has_moved_recently = True
+                consumed_event = True
+        elif (event.key == pygame.K_c and
+              (event.mod & pygame.KMOD_CTRL or event.mod & pygame.KMOD_META) and
+              not self.is_text_hidden):
+            if abs(self.select_range[0] - self.select_range[1]) > 0:
+                low_end = min(self.select_range[0], self.select_range[1])
+                high_end = max(self.select_range[0], self.select_range[1])
+                clipboard_copy(self.text[low_end:high_end])
+                consumed_event = True
+        elif self._process_paste_event(event):
+            consumed_event = True
+        return consumed_event
+
+    def _process_paste_event(self, event: pygame.event.Event) -> bool:
+        """
+        Process a paste shortcut event. (CTRL+ V)
+
+        :param event: The event to process.
+
+        :return: True if the event is consumed.
+
+        """
+        consumed_event = False
+        if event.key == pygame.K_v and (event.mod & pygame.KMOD_CTRL or event.mod & pygame.KMOD_META):
+            new_text = clipboard_paste()
+            if self.validate_text_string(new_text):
+                if abs(self.select_range[0] - self.select_range[1]) > 0:
+                    low_end = min(self.select_range[0], self.select_range[1])
+                    high_end = max(self.select_range[0], self.select_range[1])
+                    final_text = self.text[:low_end] + new_text + self.text[high_end:]
+                    within_length_limit = True
+                    if self.length_limit is not None and len(final_text) > self.length_limit:
+                        within_length_limit = False
+                    if within_length_limit:
+                        self.text = final_text
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.text_box_layout.delete_selected_text()
+                            self.drawable_shape.apply_active_text_changes()
+                        display_new_text = new_text
+                        if self.is_text_hidden:
+                            display_new_text = self.hidden_text_char * len(new_text)
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.insert_text(display_new_text, low_end)
+                        self.edit_position = low_end + len(new_text)
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.text_box_layout.set_cursor_position(
+                                self.edit_position)
+                            self.drawable_shape.apply_active_text_changes()
+                        self.select_range = [0, 0]
+                        self.cursor_has_moved_recently = True
+                elif len(new_text) > 0:
+                    final_text = (self.text[:self.edit_position] +
+                                  new_text +
+                                  self.text[self.edit_position:])
+                    within_length_limit = True
+                    if self.length_limit is not None and len(final_text) > self.length_limit:
+                        within_length_limit = False
+                    if within_length_limit:
+                        self.text = final_text
+                        display_new_text = new_text
+                        if self.is_text_hidden:
+                            display_new_text = self.hidden_text_char * len(new_text)
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.insert_text(display_new_text, self.edit_position)
+                        self.edit_position += len(new_text)
+                        if self.drawable_shape is not None:
+                            self.drawable_shape.text_box_layout.set_cursor_position(
+                                self.edit_position)
+                            self.drawable_shape.apply_active_text_changes()
+                        self.cursor_has_moved_recently = True
+                consumed_event = True
+        return consumed_event
+
+    def _process_mouse_button_event(self, event: pygame.event.Event) -> bool:
+        """
+        Process a mouse button event.
+
+        :param event: Event to process.
+
+        :return: True if we consumed the mouse event.
+
+        """
+        consumed_event = False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == pygame.BUTTON_LEFT:
+
+            scaled_mouse_pos = self.ui_manager.calculate_scaled_mouse_position(event.pos)
+            if self.hover_point(scaled_mouse_pos[0], scaled_mouse_pos[1]):
+                if self.is_enabled:
+                    drawable_shape_space_click = (scaled_mouse_pos[0] - self.rect.left,
+                                                  scaled_mouse_pos[1] - self.rect.top)
+                    if self.drawable_shape is not None:
+                        self.drawable_shape.text_box_layout.set_cursor_from_click_pos(
+                            drawable_shape_space_click)
+                        self.edit_position = self.drawable_shape.text_box_layout.get_cursor_index()
+                        self.drawable_shape.apply_active_text_changes()
+                    double_clicking = False
+                    if self.double_click_timer < self.ui_manager.get_double_click_time():
+                        if self._calculate_double_click_word_selection():
+                            double_clicking = True
+
+                    if not double_clicking:
+                        self.select_range = [self.edit_position, self.edit_position]
+                        self.cursor_has_moved_recently = True
+                        self.selection_in_progress = True
+                        self.double_click_timer = 0.0
+
+                consumed_event = True
+        if (event.type == pygame.MOUSEBUTTONUP and
+                event.button == pygame.BUTTON_LEFT and
+                self.selection_in_progress):
+            scaled_mouse_pos = self.ui_manager.calculate_scaled_mouse_position(event.pos)
             if self.drawable_shape is not None:
-                self.drawable_shape.set_active_state('disabled')
+                if self.drawable_shape.collide_point(scaled_mouse_pos):
+                    consumed_event = True
+                    drawable_shape_space_click = (scaled_mouse_pos[0] - self.rect.left,
+                                                  scaled_mouse_pos[1] - self.rect.top)
+                    self.drawable_shape.text_box_layout.set_cursor_from_click_pos(
+                        drawable_shape_space_click)
+                    new_edit_pos = self.drawable_shape.text_box_layout.get_cursor_index()
+                    if new_edit_pos != self.edit_position:
+                        self.edit_position = new_edit_pos
+                        self.cursor_has_moved_recently = True
+                        self.select_range = [self.select_range[0], self.edit_position]
+                    self.drawable_shape.apply_active_text_changes()
+            self.selection_in_progress = False
+        return consumed_event
 
-            # clear other button state
-            self.held = False
-            self.pressed = False
-            self.is_selected = False
-            self.pressed_event = False
-
-    def enable(self):
+    def _calculate_double_click_word_selection(self):
         """
-        Re-enables the button so we can once again interact with it.
-        """
-        if not self.is_enabled:
-            self.is_enabled = True
-            if self.drawable_shape is not None:
-                self.drawable_shape.set_active_state('normal')
-
-    def _set_active(self):
-        """
-        Called when we are actively clicking on the button. Changes the colours to the appropriate
-        ones for the new state then redraws the button.
-        """
-        self.drawable_shape.set_active_state('active')
-
-    def _set_inactive(self):
-        """
-        Called when we stop actively clicking on the button. Restores the colours to the default
-        state then redraws the button.
-        """
-        self.drawable_shape.set_active_state('normal')
-
-    def select(self):
-        """
-        Called when we select focus this element. Changes the colours and image to the appropriate
-        ones for the new state then redraws the button.
-        """
-        self.is_selected = True
-        self.drawable_shape.set_active_state('selected')
-
-    def unselect(self):
-        """
-        Called when we are no longer select focusing this element. Restores the colours and image
-        to the default state then redraws the button.
-        """
-        self.is_selected = False
-        self.drawable_shape.set_active_state('normal')
-
-    def set_text(self, text: str, *, text_kwargs: Optional[Dict[str, str]] = None):
-        """
-        Sets the text on the button. The button will rebuild.
-
-        :param text: The new text to set.
-        :param text_kwargs: a dictionary of variable arguments to pass to the translated string
-                        useful when you have multiple translations that need variables inserted
-                        in the middle.
+        If we double clicked on a word in the text, select that word.
 
         """
-        any_changed = False
-        if text != self.text:
-            self.text = text
-            any_changed = True
-
-        if text_kwargs is not None:
-            if text_kwargs != self.text_kwargs:
-                self.text_kwargs = text_kwargs
-                any_changed = True
-        elif self.text_kwargs != {}:
-            self.text_kwargs = {}
-            any_changed = True
-
-        if any_changed:
-            if self.dynamic_width or self.dynamic_height:
-                self.rebuild()
-            else:
-                self.drawable_shape.set_text(translate(self.text, **self.text_kwargs))
-
-    def set_hold_range(self, xy_range: Tuple[int, int]):
-        """
-        Set x and y values, in pixels, around our button to use as the hold range for time when we
-        want to drag a button about but don't want it to slip out of our grasp too easily.
-
-        Imagine it as a large rectangle around our button, larger in all directions by whatever
-        values we specify here.
-
-        :param xy_range: The x and y values used to create our larger 'holding' rectangle.
-
-        """
-        self.hold_range = xy_range
-
-    def in_hold_range(self, position: Union[pygame.math.Vector2,
-                                            Tuple[int, int],
-                                            Tuple[float, float]]) -> bool:
-        """
-        Imagines a potentially larger rectangle around our button in which range we still grip
-        hold of our button when moving the mouse. Makes it easier to use scrollbars.
-
-        :param position: The position we are testing.
-
-        :return bool: Returns True if our position is inside the hold range.
-
-        """
-        if self.drawable_shape.collide_point(position):
+        if self.edit_position != self.select_range[0]:
+            return False
+        index = min(self.edit_position, len(self.text) - 1)
+        if index >= 0:
+            char = self.text[index]
+            # Check we clicked in the same place on a our second click.
+            pattern = re.compile(r"[\w']+")
+            if index > 0:
+                while not pattern.match(char):
+                    index -= 1
+                    if index > 0:
+                        char = self.text[index]
+                    else:
+                        break
+                while pattern.match(char):
+                    index -= 1
+                    if index > 0:
+                        char = self.text[index]
+                    else:
+                        break
+            start_select_index = index + 1 if index > 0 else index
+            index += 1
+            if index < len(self.text):
+                char = self.text[index]
+                while index < len(self.text) and pattern.match(char):
+                    index += 1
+                    if index < len(self.text):
+                        char = self.text[index]
+            end_select_index = index
+            self.select_range = [start_select_index, end_select_index]
+            self.edit_position = end_select_index
+            self.cursor_has_moved_recently = True
+            self.selection_in_progress = False
             return True
-        elif self.hold_range[0] > 0 or self.hold_range[1] > 0:
-            hold_rect = pygame.Rect((self.rect.x - self.hold_range[0],
-                                     self.rect.y - self.hold_range[1]),
-                                    (self.rect.width + (2 * self.hold_range[0]),
-                                     self.rect.height + (2 * self.hold_range[1])))
-            return bool(hold_rect.collidepoint(int(position[0]), int(position[1])))
         else:
             return False
 
+    def set_allowed_characters(self, allowed_characters: Union[str, List[str]]):
+        """
+        Sets a whitelist of characters that will be the only ones allowed in our text entry
+        element. We can either set the list directly, or request one of the already existing
+        lists by a string identifier. The currently supported lists for allowed characters are:
+
+        - 'numbers'
+        - 'letters'
+        - 'alpha_numeric'
+
+        :param allowed_characters: The characters to allow, either in a list form or one of the
+                                   supported string ids.
+
+        """
+        if isinstance(allowed_characters, str):
+            if allowed_characters == 'numbers':
+                if self.ui_manager.get_locale() in UITextEntryLine._number_character_set:
+                    self.allowed_characters = UITextEntryLine._number_character_set[
+                        self.ui_manager.get_locale()]
+                else:
+                    self.allowed_characters = UITextEntryLine._number_character_set['en']
+            elif allowed_characters == 'letters':
+                if self.ui_manager.get_locale() in UITextEntryLine._alphabet_characters_all:
+                    self.allowed_characters = UITextEntryLine._alphabet_characters_all[
+                        self.ui_manager.get_locale()]
+                else:
+                    self.allowed_characters = UITextEntryLine._alphabet_characters_all['en']
+            elif allowed_characters == 'alpha_numeric':
+                if self.ui_manager.get_locale() in UITextEntryLine._alpha_numeric_characters:
+                    self.allowed_characters = UITextEntryLine._alpha_numeric_characters[
+                        self.ui_manager.get_locale()]
+                else:
+                    self.allowed_characters = UITextEntryLine._alpha_numeric_characters['en']
+            else:
+                warnings.warn('Trying to set allowed characters by type string, but no match: '
+                              'did you mean to use a list?')
+
+        else:
+            self.allowed_characters = allowed_characters.copy()
+
+    def set_forbidden_characters(self, forbidden_characters: Union[str, List[str]]):
+        """
+        Sets a blacklist of characters that will be banned from our text entry element.
+        We can either set the list directly, or request one of the already existing lists by a
+        string identifier. The currently supported lists for forbidden characters are:
+
+        - 'numbers'
+        - 'forbidden_file_path'
+
+        :param forbidden_characters: The characters to forbid, either in a list form or one of
+                                     the supported string ids.
+
+        """
+        if isinstance(forbidden_characters, str):
+            if forbidden_characters == 'numbers':
+                if self.ui_manager.get_locale() in UITextEntryLine._number_character_set:
+                    self.forbidden_characters = UITextEntryLine._number_character_set[
+                        self.ui_manager.get_locale()]
+                else:
+                    self.forbidden_characters = UITextEntryLine._number_character_set['en']
+            elif forbidden_characters == 'forbidden_file_path':
+                if self.ui_manager.get_locale() in UITextEntryLine._forbidden_file_path_characters:
+                    self.forbidden_characters = UITextEntryLine._forbidden_file_path_characters[
+                        self.ui_manager.get_locale()]
+                else:
+                    self.forbidden_characters = (
+                        UITextEntryLine._forbidden_file_path_characters['en'])
+            else:
+                warnings.warn('Trying to set forbidden characters by type string, but no match: '
+                              'did you mean to use a list?')
+
+        else:
+            self.forbidden_characters = forbidden_characters.copy()
+
+    def validate_text_string(self, text_to_validate: str) -> bool:
+        """
+        Checks a string of text to see if any of it's characters don't meet the requirements of
+        the allowed and forbidden character sets.
+
+        :param text_to_validate: The text string to check.
+
+        """
+        is_valid = True
+        if text_to_validate is not None:
+            if self.forbidden_characters is not None:
+                for character in text_to_validate:
+                    if character in self.forbidden_characters:
+                        is_valid = False
+
+            if is_valid and self.allowed_characters is not None:
+                for character in text_to_validate:
+                    if character not in self.allowed_characters:
+                        is_valid = False
+        else:
+            is_valid = False
+
+        return is_valid
+
     def rebuild_from_changed_theme_data(self):
         """
-        Checks if any theming parameters have changed, and if so triggers a full rebuild of the
-        button's drawable shape
+        Called by the UIManager to check the theming data and rebuild whatever needs rebuilding
+        for this element when the theme data has changed.
         """
         super().rebuild_from_changed_theme_data()
         has_any_changed = False
@@ -516,71 +924,11 @@ class UIButton(UIElement):
             self.font = font
             has_any_changed = True
 
-        cols = {'normal_bg':
-                self.ui_theme.get_colour_or_gradient('normal_bg', self.combined_element_ids),
-                'hovered_bg':
-                self.ui_theme.get_colour_or_gradient('hovered_bg', self.combined_element_ids),
-                'disabled_bg':
-                self.ui_theme.get_colour_or_gradient('disabled_bg', self.combined_element_ids),
-                'selected_bg':
-                self.ui_theme.get_colour_or_gradient('selected_bg', self.combined_element_ids),
-                'active_bg':
-                self.ui_theme.get_colour_or_gradient('active_bg', self.combined_element_ids),
-                'normal_text':
-                self.ui_theme.get_colour_or_gradient('normal_text', self.combined_element_ids),
-                'hovered_text':
-                self.ui_theme.get_colour_or_gradient('hovered_text', self.combined_element_ids),
-                'disabled_text':
-                self.ui_theme.get_colour_or_gradient('disabled_text', self.combined_element_ids),
-                'selected_text':
-                self.ui_theme.get_colour_or_gradient('selected_text', self.combined_element_ids),
-                'active_text':
-                self.ui_theme.get_colour_or_gradient('active_text', self.combined_element_ids),
-                'normal_text_shadow':
-                self.ui_theme.get_colour_or_gradient('normal_text_shadow',
-                                                     self.combined_element_ids),
-                'hovered_text_shadow':
-                self.ui_theme.get_colour_or_gradient('hovered_text_shadow',
-                                                     self.combined_element_ids),
-                'disabled_text_shadow':
-                self.ui_theme.get_colour_or_gradient('disabled_text_shadow',
-                                                     self.combined_element_ids),
-                'selected_text_shadow':
-                self.ui_theme.get_colour_or_gradient('selected_text_shadow',
-                                                     self.combined_element_ids),
-                'active_text_shadow':
-                self.ui_theme.get_colour_or_gradient('active_text_shadow',
-                                                     self.combined_element_ids),
-                'normal_border':
-                self.ui_theme.get_colour_or_gradient('normal_border',
-                                                     self.combined_element_ids),
-                'hovered_border':
-                self.ui_theme.get_colour_or_gradient('hovered_border',
-                                                     self.combined_element_ids),
-                'disabled_border':
-                self.ui_theme.get_colour_or_gradient('disabled_border',
-                                                     self.combined_element_ids),
-                'selected_border':
-                self.ui_theme.get_colour_or_gradient('selected_border',
-                                                     self.combined_element_ids),
-                'active_border':
-                self.ui_theme.get_colour_or_gradient('active_border',
-                                                     self.combined_element_ids)}
-
-        if cols != self.colours:
-            self.colours = cols
-            has_any_changed = True
-
-        if self._set_any_images_from_theme():
-            has_any_changed = True
-
-        # misc
         if self._check_misc_theme_data_changed(attribute_name='shape',
                                                default_value='rectangle',
                                                casting_func=str,
                                                allowed_values=['rectangle',
-                                                               'rounded_rectangle',
-                                                               'ellipse']):
+                                                               'rounded_rectangle']):
             has_any_changed = True
 
         if self._check_shape_theming_changed(defaults={'border_width': 1,
@@ -588,182 +936,112 @@ class UIButton(UIElement):
                                                        'shape_corner_radius': 2}):
             has_any_changed = True
 
+        if self._check_misc_theme_data_changed(attribute_name='padding',
+                                               default_value=(2, 2),
+                                               casting_func=self.tuple_extract):
+            has_any_changed = True
+
         if self._check_misc_theme_data_changed(attribute_name='tool_tip_delay',
                                                default_value=1.0,
                                                casting_func=float):
             has_any_changed = True
 
-        if self._check_text_alignment_theming():
+        if self._check_theme_colours_changed():
             has_any_changed = True
-
-        if self._check_misc_theme_data_changed(attribute_name='text_shadow_size',
-                                               default_value=0,
-                                               casting_func=int):
-            has_any_changed = True
-
-        if self._check_misc_theme_data_changed(attribute_name='text_shadow_offset',
-                                               default_value=(0, 0),
-                                               casting_func=self.tuple_extract):
-            has_any_changed = True
-
-        try:
-            state_transitions = self.ui_theme.get_misc_data('state_transitions',
-                                                            self.combined_element_ids)
-        except LookupError:
-            self.state_transitions = {}
-        else:
-            if isinstance(state_transitions, dict):
-                for key in state_transitions:
-                    states = key.split('_')
-                    if len(states) == 2:
-                        start_state = states[0]
-                        target_state = states[1]
-                        try:
-                            duration = float(state_transitions[key])
-                        except ValueError:
-                            duration = 0.0
-                        self.state_transitions[(start_state, target_state)] = duration
 
         if has_any_changed:
             self.rebuild()
 
-    def _check_text_alignment_theming(self) -> bool:
+    def _check_theme_colours_changed(self):
         """
-        Checks for any changes in the theming data related to text alignment.
+        Check if any colours have changed in the theme.
 
-        :return: True if changes found.
+        :return: colour has changed.
 
         """
         has_any_changed = False
-
-        if self._check_misc_theme_data_changed(attribute_name='text_horiz_alignment',
-                                               default_value='center',
-                                               casting_func=str):
+        background_colour = self.ui_theme.get_colour_or_gradient('dark_bg',
+                                                                 self.combined_element_ids)
+        if background_colour != self.background_colour:
+            self.background_colour = background_colour
+            has_any_changed = True
+        border_colour = self.ui_theme.get_colour_or_gradient('normal_border',
+                                                             self.combined_element_ids)
+        if border_colour != self.border_colour:
+            self.border_colour = border_colour
+            has_any_changed = True
+        text_colour = self.ui_theme.get_colour_or_gradient('normal_text', self.combined_element_ids)
+        if text_colour != self.text_colour:
+            self.text_colour = text_colour
+            has_any_changed = True
+        selected_text_colour = self.ui_theme.get_colour_or_gradient('selected_text',
+                                                                    self.combined_element_ids)
+        if selected_text_colour != self.selected_text_colour:
+            self.selected_text_colour = selected_text_colour
+            has_any_changed = True
+        selected_bg_colour = self.ui_theme.get_colour_or_gradient('selected_bg',
+                                                                  self.combined_element_ids)
+        if selected_bg_colour != self.selected_bg_colour:
+            self.selected_bg_colour = selected_bg_colour
             has_any_changed = True
 
-        if self._check_misc_theme_data_changed(attribute_name='text_horiz_alignment_padding',
-                                               default_value=0,
-                                               casting_func=int):
+        disabled_background_colour = self.ui_theme.get_colour_or_gradient('disabled_dark_bg',
+                                                                          self.combined_element_ids)
+        if disabled_background_colour != self.disabled_background_colour:
+            self.disabled_background_colour = disabled_background_colour
             has_any_changed = True
 
-        if self._check_misc_theme_data_changed(attribute_name='text_horiz_alignment_method',
-                                               default_value='rect',
-                                               casting_func=str):
+        disabled_border_colour = self.ui_theme.get_colour_or_gradient('disabled_border',
+                                                                      self.combined_element_ids)
+        if disabled_border_colour != self.disabled_border_colour:
+            self.disabled_border_colour = disabled_border_colour
             has_any_changed = True
 
-        if self._check_misc_theme_data_changed(attribute_name='text_vert_alignment',
-                                               default_value='center',
-                                               casting_func=str):
+        disabled_text_colour = self.ui_theme.get_colour_or_gradient('disabled_text',
+                                                                    self.combined_element_ids)
+        if disabled_text_colour != self.disabled_text_colour:
+            self.disabled_text_colour = disabled_text_colour
             has_any_changed = True
 
-        if self._check_misc_theme_data_changed(attribute_name='text_vert_alignment_padding',
-                                               default_value=0,
-                                               casting_func=int):
+        text_cursor_colour = self.ui_theme.get_colour_or_gradient('text_cursor',
+                                                                  self.combined_element_ids)
+        if text_cursor_colour != self.text_cursor_colour:
+            self.text_cursor_colour = text_cursor_colour
             has_any_changed = True
 
         return has_any_changed
 
-    def rebuild(self):
+    def disable(self):
         """
-        A complete rebuild of the drawable shape used by this button.
-
+        Disables the element so that it is no longer interactive.
         """
+        if self.is_enabled:
+            self.is_enabled = False
 
-        theming_parameters = {'normal_bg': self.colours['normal_bg'],
-                              'normal_text': self.colours['normal_text'],
-                              'normal_text_shadow': self.colours['normal_text_shadow'],
-                              'normal_border': self.colours['normal_border'],
-                              'normal_image': self.normal_image,
-                              'hovered_bg': self.colours['hovered_bg'],
-                              'hovered_text': self.colours['hovered_text'],
-                              'hovered_text_shadow': self.colours['hovered_text_shadow'],
-                              'hovered_border': self.colours['hovered_border'],
-                              'hovered_image': self.hovered_image,
-                              'disabled_bg': self.colours['disabled_bg'],
-                              'disabled_text': self.colours['disabled_text'],
-                              'disabled_text_shadow': self.colours['disabled_text_shadow'],
-                              'disabled_border': self.colours['disabled_border'],
-                              'disabled_image': self.disabled_image,
-                              'selected_bg': self.colours['selected_bg'],
-                              'selected_text': self.colours['selected_text'],
-                              'selected_text_shadow': self.colours['selected_text_shadow'],
-                              'selected_border': self.colours['selected_border'],
-                              'selected_image': self.selected_image,
-                              'active_bg': self.colours['active_bg'],
-                              'active_border': self.colours['active_border'],
-                              'active_text': self.colours['active_text'],
-                              'active_text_shadow': self.colours['active_text_shadow'],
-                              'active_image': self.selected_image,
-                              'border_width': self.border_width,
-                              'shadow_width': self.shadow_width,
-                              'font': self.font,
-                              'text': translate(self.text, **self.text_kwargs),
-                              'text_shadow': (self.text_shadow_size,
-                                              self.text_shadow_offset[0],
-                                              self.text_shadow_offset[1],
-                                              self.colours['normal_text_shadow'],
-                                              True),
-                              'text_horiz_alignment': self.text_horiz_alignment,
-                              'text_vert_alignment': self.text_vert_alignment,
-                              'text_horiz_alignment_padding': self.text_horiz_alignment_padding,
-                              'text_horiz_alignment_method': self.text_horiz_alignment_method,
-                              'text_vert_alignment_padding': self.text_vert_alignment_padding,
-                              'shape_corner_radius': self.shape_corner_radius,
-                              'transitions': self.state_transitions}
+            # clear state
+            self.is_focused = False
+            self.selection_in_progress = False
+            self.cursor_on = False
+            self.cursor_has_moved_recently = False
 
-        drawable_shape_rect = self.rect.copy()
-        if self.dynamic_width:
-            drawable_shape_rect.width = -1
-        if self.dynamic_height:
-            drawable_shape_rect.height = -1
-
-        if self.shape == 'rectangle':
-            self.drawable_shape = RectDrawableShape(drawable_shape_rect, theming_parameters,
-                                                    ['normal', 'hovered', 'disabled',
-                                                     'selected', 'active'], self.ui_manager)
-        elif self.shape == 'ellipse':
-            self.drawable_shape = EllipseDrawableShape(drawable_shape_rect, theming_parameters,
-                                                       ['normal', 'hovered', 'disabled',
-                                                        'selected', 'active'], self.ui_manager)
-        elif self.shape == 'rounded_rectangle':
-            self.drawable_shape = RoundedRectangleShape(drawable_shape_rect, theming_parameters,
-                                                        ['normal', 'hovered', 'disabled',
-                                                         'selected', 'active'], self.ui_manager)
-
-        if not self.is_enabled:
             if self.drawable_shape is not None:
                 self.drawable_shape.set_active_state('disabled')
+                self.background_and_border = self.drawable_shape.get_surface('disabled')
+            self.edit_position = 0
+            self.select_range = [0, 0]
+            self.redraw()
 
-        self.on_fresh_drawable_shape_ready()
-
-        self._on_contents_changed()
-
-    def _calc_dynamic_size(self):
-        if self.dynamic_width or self.dynamic_height:
-            self.set_dimensions(self.image.get_size())
-
-            # if we have anchored the left side of our button to the right of its container then
-            # changing the width is going to mess up the horiz position as well.
-            new_left = self.relative_rect.left
-            new_top = self.relative_rect.top
-            if 'left' in self.anchors and self.anchors['left'] == 'right' and self.dynamic_width:
-                left_offset = self.dynamic_dimensions_orig_top_left[0]
-                new_left = left_offset - self.relative_rect.width
-            # if we have anchored the top side of our button to the bottom of it's container then
-            # changing the height is going to mess up the vert position as well.
-            if 'top' in self.anchors and self.anchors['top'] == 'bottom' and self.dynamic_height:
-                top_offset = self.dynamic_dimensions_orig_top_left[1]
-                new_top = top_offset - self.relative_rect.height
-
-            self.set_relative_position((new_left, new_top))
-
-    def hide(self):
+    def enable(self):
         """
-        In addition to the base UIElement.hide() - Change the hovered state to a normal state.
+        Re-enables the element so we can once again interact with it.
         """
-        super().hide()
-
-        self.on_unhovered()
+        if not self.is_enabled:
+            self.is_enabled = True
+            self.text_entered = False
+            if self.drawable_shape is not None:
+                self.drawable_shape.set_active_state('normal')
+                self.background_and_border = self.drawable_shape.get_surface('normal')
+            self.redraw()
 
     def on_locale_changed(self):
         font = self.ui_theme.get_font(self.combined_element_ids)
@@ -771,7 +1049,12 @@ class UIButton(UIElement):
             self.font = font
             self.rebuild()
         else:
-            if self.dynamic_width or self.dynamic_height:
-                self.rebuild()
-            else:
-                self.drawable_shape.set_text(translate(self.text, **self.text_kwargs))
+            display_text = self.text
+            if self.is_text_hidden:
+                display_text = self.hidden_text_char * len(self.text)
+            if self.drawable_shape is not None:
+                self.drawable_shape.set_text(display_text if len(display_text) > 0
+                                             else translate(self.placeholder_text))
+
+    def clear(self):
+        self.set_text("")
